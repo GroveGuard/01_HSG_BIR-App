@@ -6,8 +6,6 @@ import logging
 from pathlib import Path
 import hashlib
 import os
-import threading
-import logging
 
 # Dies definiert logger immer, auch wenn noch nicht vom Launcher injiziert
 logger = logging.getLogger(__name__)
@@ -149,17 +147,20 @@ class HandballTrackerApp:
         self.login_error_banner = ft.Container(height=0)
         self.add_drink_success_banner = ft.Container(height=0)
         self.pending_user_delete = None
-        
+        self.prefs = ft.SharedPreferences()
+
         logger.info("HandballTrackerApp wird initialisiert")
-        
-        self.load_session()
+
+    async def start(self):
+        """Async-Einstiegspunkt: lädt die Session, baut dann die UI."""
+        await self.load_session()
         self.setup_ui()
     
-    def load_session(self):
-        """Lädt gespeicherte Session aus Browser Storage"""
+    async def load_session(self):
+        """Lädt gespeicherte Session aus Persistent Storage"""
         try:
-            if self.page.client_storage.contains_key("user_id"):
-                user_id = self.page.client_storage.get("user_id")
+            if await self.prefs.contains_key("user_id"):
+                user_id = await self.prefs.get("user_id")
                 self.current_user = self.get_user_by_id(user_id)
                 if self.current_user:
                     self.is_admin = self.current_user.get('is_admin', False)
@@ -167,14 +168,14 @@ class HandballTrackerApp:
         except Exception as e:
             logger.exception(f"Fehler beim Laden der Session: {e}")
     
-    def save_session(self, user_id=None):
-        """Speichert Session in Browser Storage"""
+    async def save_session(self, user_id=None):
+        """Speichert Session in Persistent Storage"""
         try:
             if user_id:
-                self.page.client_storage.set("user_id", user_id)
+                await self.prefs.set("user_id", user_id)
                 logger.info(f"Session gespeichert: User ID {user_id}")
             else:
-                self.page.client_storage.remove("user_id")
+                await self.prefs.remove("user_id")
                 logger.info("Session gelöscht")
         except Exception as e:
             logger.exception(f"Fehler beim Speichern der Session: {e}")
@@ -502,53 +503,32 @@ class HandballTrackerApp:
     
     def open_date_picker(self, picker):
         """Öffnet einen DatePicker"""
-        picker.open = True
-        self.page.update()
+        self.page.show_dialog(picker)
     
     def on_drink_date_change(self, e, button):
         """Handler für Datumänderungen im Getränke-Tab"""
-        if e.data and button:
-            date_str = e.data.split('T')[0]
-            self.selected_date = datetime.strptime(date_str, "%Y-%m-%d")
-            button.text = self.selected_date.strftime("%Y-%m-%d")
+        if e.control.value and button:
+            self.selected_date = e.control.value
+            button.content = self.selected_date.strftime("%Y-%m-%d")
             self.page.update()
     
     def on_admin_date_change(self, e, button):
         """Handler für Datumänderungen im Admin-Tab"""
-        if e.data and button:
-            date_str = e.data.split('T')[0]
-            self.admin_selected_date = datetime.strptime(date_str, "%Y-%m-%d")
-            button.text = self.admin_selected_date.strftime("%Y-%m-%d")
+        if e.control.value and button:
+            self.admin_selected_date = e.control.value
+            button.content = self.admin_selected_date.strftime("%Y-%m-%d")
             self.page.update()
     
     def show_snackbar(self, message: str, color):
         """Zeigt eine Snackbar-Benachrichtigung"""
-        self.page.snack_bar = ft.SnackBar(
-            content=ft.Text(message, color=ft.Colors.WHITE),
-            bgcolor=color,
-            duration=3000,
+        self.page.show_dialog(
+            ft.SnackBar(
+                content=ft.Text(message, color=ft.Colors.WHITE),
+                bgcolor=color,
+                duration=ft.Duration(seconds=3),
+            )
         )
-        self.page.snack_bar.open = True
-        self.page.update()
 
-    def _clear_login_banner(self):
-        try:
-            self.login_error_banner.content = None
-            self.login_error_banner.bgcolor = None
-            self.login_error_banner.height = 0
-            self.page.update()
-        except Exception:
-            pass
-
-    def _clear_add_banner(self):
-        try:
-            self.add_drink_success_banner.content = None
-            self.add_drink_success_banner.bgcolor = None
-            self.add_drink_success_banner.height = 0
-            self.page.update()
-        except Exception:
-            pass
-    
     def show_login_screen(self):
         """Zeigt Login-Bildschirm"""
         logger.debug("Zeige Login-Bildschirm")
@@ -576,7 +556,7 @@ class HandballTrackerApp:
             width=300,
         )
         
-        def login_clicked(e):
+        async def login_clicked(e):
             if not username_field.value or not password_field.value:
                 login_error_banner.content = ft.Text("Bitte alle Felder ausfüllen", color=ft.Colors.WHITE)
                 login_error_banner.bgcolor = ft.Colors.RED
@@ -585,7 +565,6 @@ class HandballTrackerApp:
                 login_error_banner.height = None
                 self.page.update()
                 self.show_snackbar("Bitte alle Felder ausfüllen", ft.Colors.RED)
-                threading.Timer(3.0, lambda: self._clear_login_banner()).start()
                 return
             
             success, user = self.login_user(username_field.value, password_field.value)
@@ -596,7 +575,7 @@ class HandballTrackerApp:
                 login_error_banner.height = 0
                 self.current_user = user
                 self.is_admin = user.get('is_admin', False)
-                self.save_session(user["player_id"])
+                await self.save_session(user["player_id"])
                 self.show_snackbar(f"Willkommen, {user['full_name']}!", ft.Colors.GREEN)
                 self.setup_ui()
             else:
@@ -607,12 +586,11 @@ class HandballTrackerApp:
                 login_error_banner.height = None
                 self.page.update()
                 self.show_snackbar("Falscher Username oder Passwort", ft.Colors.RED)
-                threading.Timer(3.0, lambda: self._clear_login_banner()).start()
         
         def register_clicked(e):
             self.show_register_screen()
         
-        login_button = ft.ElevatedButton(
+        login_button = ft.Button(
             "Einloggen",
             icon=ft.Icons.LOGIN,
             on_click=login_clicked,
@@ -734,7 +712,7 @@ class HandballTrackerApp:
                         password_field,
                         password_confirm_field,
                         ft.Container(height=10),
-                        ft.ElevatedButton(
+                        ft.Button(
                             "Registrieren",
                             icon=ft.Icons.CHECK,
                             on_click=register_submit,
@@ -758,10 +736,10 @@ class HandballTrackerApp:
         
         self.page.clean()
         
-        def logout_clicked(e):
+        async def logout_clicked(e):
             self.current_user = None
             self.is_admin = False
-            self.save_session()
+            await self.save_session()
             logger.info("Benutzer abgemeldet")
             self.setup_ui()
         
@@ -870,20 +848,20 @@ class HandballTrackerApp:
         add_success_banner = self.add_drink_success_banner
 
         drink_date_picker = ft.DatePicker(
+            value=self.selected_date,
             on_change=lambda e: self.on_drink_date_change(e, None),
             first_date=datetime(2020, 1, 1),
             last_date=datetime(2030, 12, 31),
         )
 
-        date_button = ft.ElevatedButton(
-            text=self.selected_date.strftime("%Y-%m-%d"),
+        date_button = ft.Button(
+            self.selected_date.strftime("%Y-%m-%d"),
             icon=ft.Icons.CALENDAR_MONTH,
             on_click=lambda _: self.open_date_picker(drink_date_picker),
             width=300,
         )
 
         drink_date_picker.on_change = lambda e: self.on_drink_date_change(e, date_button)
-        self.page.overlay.append(drink_date_picker)
 
         drink_dropdown = ft.Dropdown(
             label="Getränk",
@@ -936,7 +914,6 @@ class HandballTrackerApp:
                 add_success_banner.height = None
                 self.page.update()
                 self.show_snackbar(f"{quantity}x {drink_dropdown.value} eingetragen!", ft.Colors.GREEN)
-                threading.Timer(3.0, lambda: self._clear_add_banner()).start()
                 self.tab_content.content = self.show_add_drink_tab()
                 self.page.update()
             else:
@@ -953,7 +930,7 @@ class HandballTrackerApp:
                 date_button,
                 notes_field,
                 ft.Container(height=10),
-                ft.ElevatedButton(
+                ft.Button(
                     "Speichern",
                     icon=ft.Icons.SAVE,
                     on_click=save_drink,
@@ -1337,23 +1314,23 @@ class HandballTrackerApp:
             self.admin_selected_date = datetime.now()
         
         admin_date_picker = ft.DatePicker(
+            value=self.admin_selected_date,
             on_change=lambda e: self.on_admin_date_change(e, None),
             first_date=datetime(2020, 1, 1),
             last_date=datetime(2030, 12, 31),
         )
         
-        admin_date_button = ft.ElevatedButton(
-            text=self.admin_selected_date.strftime("%Y-%m-%d"),
+        admin_date_button = ft.Button(
+            self.admin_selected_date.strftime("%Y-%m-%d"),
             icon=ft.Icons.CALENDAR_MONTH,
             on_click=lambda _: self.open_date_picker(admin_date_picker),
             width=300,
         )
         
         admin_date_picker.on_change = lambda e: self.on_admin_date_change(e, admin_date_button)
-        self.page.overlay.append(admin_date_picker)
         
         users_for_dropdown = self.get_all_users()
-        users_options = [ft.DropdownOption(f"{u['id']}|{u['full_name']}") for u in users_for_dropdown]
+        users_options = [ft.DropdownOption(key=f"{u['id']}|{u['full_name']}", text=u['full_name']) for u in users_for_dropdown]
         users_dropdown = ft.Dropdown(
             label="Benutzer",
             options=users_options,
@@ -1361,7 +1338,7 @@ class HandballTrackerApp:
         )
         if users_options:
             try:
-                users_dropdown.value = users_options[0].text
+                users_dropdown.value = users_options[0].key
             except Exception:
                 users_dropdown.value = f"{users_for_dropdown[0]['id']}|{users_for_dropdown[0]['full_name']}"
 
@@ -1407,8 +1384,8 @@ class HandballTrackerApp:
                     ft.Divider(),
                     ft.Row([users_dropdown]),
                     ft.Row([admin_date_button]),
-                    ft.ElevatedButton(
-                        "Alle Getränke bis Stichtag als bezahlt markieren", 
+                    ft.Button(
+                        "Alle Getränke bis Stichtag als bezahlt markieren",
                         icon=ft.Icons.CHECK_CIRCLE,
                         on_click=mark_paid_until,
                         style=ft.ButtonStyle(
@@ -1551,7 +1528,7 @@ class HandballTrackerApp:
                             (lambda uid=user['id'], uname=user['username']: (
                                 (ft.Row([
                                     ft.Text("Löschen?", size=12, color=ft.Colors.RED_700),
-                                    ft.ElevatedButton("Ja", on_click=make_delete_handler(uid, uname)['confirm'], style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE)),
+                                    ft.Button("Ja", on_click=make_delete_handler(uid, uname)['confirm'], style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE)),
                                     ft.TextButton("Nein", on_click=make_delete_handler(uid, uname)['cancel']),
                                 ])) if self.pending_user_delete == uid else ft.Row([
                                     ft.IconButton(
@@ -1630,8 +1607,8 @@ class HandballTrackerApp:
                 border_radius=10,
             )
             
-            toggle_button = ft.ElevatedButton(
-                text="Als bezahlt markieren" if not drink['paid'] else "Als offen markieren",
+            toggle_button = ft.Button(
+                "Als bezahlt markieren" if not drink['paid'] else "Als offen markieren",
                 icon=ft.Icons.CHECK if not drink['paid'] else ft.Icons.CLOSE,
                 on_click=make_toggle_handler(drink['id'], drink['paid']),
                 style=ft.ButtonStyle(
@@ -1697,11 +1674,12 @@ class HandballTrackerApp:
         return drinks_list
 
 
-def main(page: ft.Page):
+async def main(page: ft.Page):
     """Einstiegspunkt der Anwendung"""
     init_database()
     
-    HandballTrackerApp(page)
+    app_instance = HandballTrackerApp(page)
+    await app_instance.start()
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)
