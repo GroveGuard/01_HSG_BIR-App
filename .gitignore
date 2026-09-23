@@ -1,4 +1,4 @@
-handball_tracker.db
+src/handball_tracker.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
