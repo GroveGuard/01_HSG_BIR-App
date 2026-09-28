@@ -1,0 +1,123 @@
+name: Deploy BIR-App release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Vorhandener Release-Tag, z. B. v0.1.0"
+        required: true
+        type: string
+      deploy:
+        description: "Release-Tag tatsaechlich auschecken"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+
+    steps:
+      - name: cloudflared herunterladen
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/cloudflared" \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: Uploader-Release pruefen oder deployen
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+          DO_DEPLOY: ${{ github.event_name == 'release' || inputs.deploy }}
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CLOUDFLARE_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CLOUDFLARE_ACCESS_CLIENT_SECRET }}
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_SSH_PASSPHRASE: ${{ secrets.DEPLOY_SSH_PASSPHRASE }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          : "${RELEASE_TAG:?Release-Tag fehlt}"
+          : "${TUNNEL_SERVICE_TOKEN_ID:?Cloudflare Client ID fehlt}"
+          : "${TUNNEL_SERVICE_TOKEN_SECRET:?Cloudflare Client Secret fehlt}"
+          : "${DEPLOY_SSH_PRIVATE_KEY:?Privater SSH-Schluessel fehlt}"
+          : "${DEPLOY_SSH_PASSPHRASE:?SSH-Passphrase fehlt}"
+          : "${SSH_KNOWN_HOSTS:?SSH_KNOWN_HOSTS fehlt}"
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+            echo "Release-Tag enthaelt nicht erlaubte Zeichen."
+            exit 1
+          fi
+
+          install -m 700 -d "$HOME/.ssh"
+
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          cat > "$RUNNER_TEMP/ssh-askpass" <<'SH'
+          #!/usr/bin/env bash
+          printf '%s\n' "$DEPLOY_SSH_PASSPHRASE"
+          SH
+          chmod 700 "$RUNNER_TEMP/ssh-askpass"
+
+          eval "$(ssh-agent -s)"
+          trap 'ssh-agent -k >/dev/null' EXIT
+
+          DISPLAY=:0 \
+          SSH_ASKPASS="$RUNNER_TEMP/ssh-askpass" \
+          SSH_ASKPASS_REQUIRE=force \
+          setsid -w ssh-add "$HOME/.ssh/deploy_key" </dev/null
+
+          ssh_cmd=(
+            ssh
+            -o "ProxyCommand=$RUNNER_TEMP/cloudflared access ssh --hostname %h"
+            -o StrictHostKeyChecking=yes
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o ConnectTimeout=30
+            -i "$HOME/.ssh/deploy_key"
+            Lebio@ssh.hessenautomation.de
+          )
+
+          # Fuer GitHub-Zugriffe auf Windows ein Terminal erzwingen.
+          # Die reine Statuspruefung nutzt weiterhin ssh_cmd ohne PTY.
+          ssh_git_cmd=(ssh -tt "${ssh_cmd[@]:1}")
+
+          repo=C:/Python_Repo/Fletapps/01_HSG_BIR-App
+
+          # Gilt nur fuer den jeweiligen Remote-Befehl.
+          # Verhindert interaktive GitHub-Passphrase-Abfragen im Job.
+          git_ssh='C:/Windows/System32/OpenSSH/ssh.exe -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -i C:/Users/Lebio/.ssh/id_rsa'
+
+          changes=$("${ssh_cmd[@]}" "git -C $repo status --porcelain")
+          changes=${changes//$'\r'/}
+
+          if [[ -n "$changes" ]]; then
+            echo "Abbruch: Im Uploader-Clone liegen lokale Aenderungen oder unversionierte Dateien."
+            exit 1
+          fi
+
+          "${ssh_git_cmd[@]}" \
+            "set GIT_SSH_COMMAND=$git_ssh&& git -C $repo ls-remote --exit-code origin refs/tags/$RELEASE_TAG"
+
+          if [[ "$DO_DEPLOY" != "true" ]]; then
+            echo "Lesetest erfolgreich; kein Fetch und kein Checkout ausgefuehrt."
+            exit 0
+          fi
+
+          "${ssh_git_cmd[@]}" \
+            "set GIT_SSH_COMMAND=$git_ssh&& git -C $repo fetch origin refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG && git -C $repo switch --detach refs/tags/$RELEASE_TAG"
+
+          echo "Uploader-Clone wurde auf Release-Tag $RELEASE_TAG gesetzt."
